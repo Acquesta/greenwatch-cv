@@ -2,534 +2,385 @@ import cv2
 import numpy as np
 import time
 import os
-import json
-import math
-from datetime import datetime
-
-# Tenta importar a biblioteca ultralytics para suporte a YOLOv8
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
+from ultralytics import YOLO
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 # ==============================================================================
-# CONFIGURAÇÕES E CONSTANTES
+# 1. CONFIGURAÇÕES E CONSTANTES
 # ==============================================================================
-SNAPSHOTS_DIR = "snapshots"
-ALERTS_LOG_FILE = "alerts_log.json"
-WINDOW_NAME = "GreenWatch CV - Sistema de Sensoriamento Orbital e Alertas"
-VIEW_W, VIEW_H = 640, 640 # Resolução nativa de processamento e entrada do YOLO
-HUD_W, HUD_H = 1280, 720  # Resolução da tela final do Dashboard
-
 SATELLITE_DIR = "satellite_images"
+WINDOW_NAME = "GreenWatch CV - Central de Controle Gestual MediaPipe"
+MAP_W, MAP_H = 1280, 720  # Dimensões da tela de satélite do HUD
+ZOOM_W, ZOOM_H = 360, 270  # Dimensões da janela de Zoom no HUD
+MODEL_PATH = "hand_landmarker.task"
+
+# Conexões anatômicas da mão para desenho do esqueleto
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),      # Polegar
+    (0, 5), (5, 6), (6, 7), (7, 8),      # Indicador
+    (5, 9), (9, 10), (10, 11), (11, 12),  # Médio
+    (9, 13), (13, 14), (14, 15), (15, 16),# Anelar
+    (13, 17), (17, 18), (18, 19), (19, 20),# Mindinho
+    (0, 17)                              # Palma
+]
+
 SCENARIOS = {
     "1": {
         "name": "amazon_fire.png",
-        "title": "Floresta Amazonica (Focos Ativos)",
-        "lat": -3.4654,
-        "lon": -62.2145,
-        "region": "Codajas - AM",
-        # Focos absolutos na escala 1600x1200 [x_center, y_center, width, height, class]
+        "title": "Codajas (AM) - Amazonia",
+        "lat": -3.4654, "lon": -62.2145,
         "targets": [
-            [1000, 380, 240, 200, "fogo", 0.94],
-            [1020, 420, 320, 280, "fumaca", 0.88]
+            [800, 240, 200, 160, "fogo", 0.94],
+            [820, 260, 250, 220, "fumaca", 0.88]
         ]
     },
     "2": {
         "name": "pantanal_smoke.png",
-        "title": "Bacia do Pantanal (Pluma de Fumaca)",
-        "lat": -18.0125,
-        "lon": -56.4820,
-        "region": "Corumba - MS",
+        "title": "Corumba (MS) - Pantanal",
+        "lat": -18.0125, "lon": -56.4820,
         "targets": [
-            [800, 600, 520, 450, "fumaca", 0.91]
+            [640, 360, 420, 360, "fumaca", 0.91]
         ]
     },
     "3": {
         "name": "deforestation_burn.png",
-        "title": "Cerrado / Amazonia (Cicatrizes de Queimada)",
-        "lat": -11.5080,
-        "lon": -53.6492,
-        "region": "Querencia - MT",
+        "title": "Querencia (MT) - Cerrado",
+        "lat": -11.5080, "lon": -53.6492,
         "targets": [
-            [480, 720, 180, 150, "fogo", 0.89],
-            [1120, 460, 280, 220, "fumaca", 0.82],
-            [510, 730, 260, 210, "fumaca", 0.84]
+            [380, 430, 150, 120, "fogo", 0.89],
+            [900, 280, 220, 180, "fumaca", 0.82],
+            [410, 440, 210, 170, "fumaca", 0.84]
         ]
     }
 }
 
-# Inicializa pastas e arquivos
-os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
-os.makedirs(SATELLITE_DIR, exist_ok=True)
-if not os.path.exists(ALERTS_LOG_FILE):
-    with open(ALERTS_LOG_FILE, "w", encoding="utf-8") as f:
-        json.dump([], f, ensure_ascii=False, indent=4)
+# ==============================================================================
+# 2. FUNÇÕES AUXILIARES DE RASTREAMENTO E RENDERIZAÇÃO
+# ==============================================================================
+def carregar_satelite(scenario_key):
+    """Carrega a imagem de satélite do cenário ativo e a redimensiona para o HUD."""
+    cfg = SCENARIOS[scenario_key]
+    path = os.path.join(SATELLITE_DIR, cfg["name"])
+    if not os.path.exists(path):
+        img = np.ones((MAP_H, MAP_W, 3), dtype=np.uint8) * 45
+        cv2.putText(img, "MAPA INDISPONIVEL", (400, 360), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (150, 150, 150), 2)
+        return img
+    return cv2.resize(cv2.imread(path), (MAP_W, MAP_H))
 
-# ==============================================================================
-# REGISTRO DE ALERTAS GIS
-# ==============================================================================
-class GISAlertLogger:
-    @staticmethod
-    def log_alert(threat, confidence, lat, lon, area_ha, region):
-        """Grava alerta no JSON com metadados georreferenciados."""
-        now = datetime.now()
-        alert_entry = {
-            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "time_only": now.strftime("%H:%M:%S"),
-            "threat": threat.upper(),
-            "confidence_pct": round(confidence * 100, 1),
-            "coordinates": {
-                "latitude": round(lat, 5),
-                "longitude": round(lon, 5)
-            },
-            "area_hectares": round(area_ha, 1),
-            "region": region,
-            "satellite": "GREENWATCH-1"
-        }
+def desenhar_esqueleto_mao(frame, landmarks, w_frame, h_frame):
+    """Desenha as articulações e conexões da mão no quadro da webcam (PIP)."""
+    # Desenha as linhas de conexão
+    for start, end in HAND_CONNECTIONS:
+        pt_start = landmarks[start]
+        pt_end = landmarks[end]
+        x1, y1 = int(pt_start.x * w_frame), int(pt_start.y * h_frame)
+        x2, y2 = int(pt_end.x * w_frame), int(pt_end.y * h_frame)
+        cv2.line(frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
         
-        try:
-            with open(ALERTS_LOG_FILE, "r", encoding="utf-8") as file:
-                logs = json.load(file)
-        except (json.JSONDecodeError, FileNotFoundError):
-            logs = []
-            
-        # Evita spam: registra apenas se passaram 5 segundos do último alerta idêntico na mesma região
-        should_write = True
-        if logs:
-            last_same = [l for l in logs if l.get("threat") == alert_entry["threat"] and l.get("region") == region]
-            if last_same:
-                last_time_str = last_same[-1].get("timestamp")
-                if last_time_str:
-                    last_time = datetime.strptime(last_time_str, "%Y-%m-%d %H:%M:%S")
-                    if (now - last_time).total_seconds() < 5.0:
-                        should_write = False
-                    
-        if should_write:
-            logs.append(alert_entry)
-            with open(ALERTS_LOG_FILE, "w", encoding="utf-8") as file:
-                json.dump(logs, file, ensure_ascii=False, indent=4)
-            print(f"[ALERTA ORBITAL] {alert_entry['timestamp']} - {alert_entry['threat']} em {region} (Área: {area_ha} ha)")
-            
-        return alert_entry
+    # Desenha os círculos das articulações
+    for idx, pt in enumerate(landmarks):
+        x, y = int(pt.x * w_frame), int(pt.y * h_frame)
+        color = (0, 255, 0) if idx in [4, 8, 12, 16, 20] else (0, 255, 255)
+        cv2.circle(frame, (x, y), 4, color, -1)
+
+def contar_dedos_abertos(landmarks):
+    """Retorna o número de dedos abertos com base nas posições dos landmarks."""
+    dedos = [
+        landmarks[8].y < landmarks[6].y,   # Indicador
+        landmarks[12].y < landmarks[10].y, # Médio
+        landmarks[16].y < landmarks[14].y, # Anelar
+        landmarks[20].y < landmarks[18].y, # Mindinho
+        abs(landmarks[4].x - landmarks[2].x) > 0.08 # Polegar (limiar lateral)
+    ]
+    return sum(dedos)
 
 # ==============================================================================
-# MOTOR DETECTOR DE IA (YOLOv8 REAL + MOCK GEORREFERENCIADO)
+# 3. DETECTOR DE INCÊNDIOS HÍBRIDO (YOLOv8 + Mock)
 # ==============================================================================
-class SatelliteYoloDetector:
+class ZoomYoloDetector:
+    """Carrega o modelo YOLOv8 ou simula detecções táticas caso ausente."""
     def __init__(self):
         self.model = None
         self.yolo_loaded = False
         self.weight_name = "Nenhum"
-        self.init_model()
+        try:
+            self.model = YOLO("best.pt")
+            self.yolo_loaded = True
+            self.weight_name = "best.pt"
+            print("[YOLO] Modelo 'best.pt' carregado com sucesso!")
+        except Exception:
+            print("[YOLO] 'best.pt' nao encontrado. Rodando em modo de simulacao.")
 
-    def init_model(self):
-        if not YOLO_AVAILABLE:
-            print("[YOLO] Biblioteca 'ultralytics' não encontrada. Rodando no modo de simulação georreferenciada.")
-            return
-
-        # Busca pesos para carregar
-        weights_options = ["fire_smoke_yolo.pt", "best.pt", "yolov8s.pt", "yolov8n.pt"]
-        for weight in weights_options:
-            try:
-                print(f"[YOLO] Tentando carregar pesos: '{weight}'...")
-                self.model = YOLO(weight)
-                self.yolo_loaded = True
-                self.weight_name = weight
-                print(f"[YOLO] IA carregada com sucesso com pesos: '{weight}'!")
-                break
-            except Exception as e:
-                print(f"[YOLO] Não foi possível carregar '{weight}': {str(e)}")
-
-    def detect(self, viewport_frame, scenario_key, sweep_x, sweep_y):
-        """
-        Executa detecção sobre o recorte de satélite ativo.
-        Caso o arquivo de pesos real não esteja na pasta, ele executa um detector MOCK
-        baseado na correspondência exata de coordenadas do satélite na imagem de alta resolução.
-        Isso garante o funcionamento imediato do pipeline orbital e dos logs.
-        """
+    def detect(self, zoom_frame, scenario_key, x1_lupa, y1_lupa, lupa_w, lupa_h):
+        """Identifica focos de fogo/fumaça no quadro de zoom ampliado."""
+        # Caminho 1: Inferência em tempo real via YOLOv8
         if self.yolo_loaded:
-            # Inferência Real do YOLOv8
             try:
-                results = self.model.predict(source=viewport_frame, conf=0.25, verbose=False)
                 detections = []
-                
+                results = self.model.predict(source=zoom_frame, conf=0.25, verbose=False)
                 for box in results[0].boxes:
-                    coords = box.xyxy[0].tolist() # [x1, y1, x2, y2]
-                    x1, y1, x2, y2 = map(int, coords)
-                    w, h = x2 - x1, y2 - y1
+                    zx1, zy1, zx2, zy2 = map(int, box.xyxy[0].tolist())
                     conf = float(box.conf[0])
-                    cls_id = int(box.cls[0])
-                    
-                    class_name = self.model.names[cls_id].lower()
-                    
-                    # Normaliza classes de fogo/fumaça
-                    normalized_class = ""
-                    if "fire" in class_name or "fogo" in class_name or "flame" in class_name:
-                        normalized_class = "fogo"
-                    elif "smoke" in class_name or "fumaca" in class_name or "gray" in class_name:
-                        normalized_class = "fumaca"
-                    else:
-                        normalized_class = class_name
-                        
+                    cls = self.model.names[int(box.cls[0])].lower()
+                    norm_cls = "fogo" if any(x in cls for x in ["fire", "fogo", "flame"]) else "fumaca"
                     detections.append({
-                        "class": normalized_class,
-                        "bbox": (x1, y1, w, h),
-                        "confidence": conf,
-                        "center": (x1 + w//2, y1 + h//2)
+                        "class": norm_cls,
+                        "bbox_zoom": (zx1, zy1, zx2 - zx1, zy2 - zy1),
+                        "confidence": conf
                     })
                 return detections
-            except Exception as e:
-                print(f"[YOLO ERROR] Falha na inferência real: {e}. Alternando para simulação orbital.")
-        
-        # Detector MOCK Georreferenciado
-        # Projetar caixas absolutas do cenário para o recorte local de 640x640 da varredura
+            except Exception:
+                pass
+
+        # Caminho 2: Detector Mock Georreferenciado Proporcional (Fallback)
         detections = []
         cfg = SCENARIOS[scenario_key]
-        
         for tgt in cfg["targets"]:
             tx_center, ty_center, tw, th, cls_name, base_conf = tgt
+            tx1, ty1 = tx_center - tw // 2, ty_center - th // 2
+            tx2, ty2 = tx_center + tw // 2, ty_center + th // 2
             
-            # Limites absolutos do alvo
-            tx1 = tx_center - tw // 2
-            ty1 = ty_center - th // 2
-            tx2 = tx_center + tw // 2
-            ty2 = ty_center + th // 2
+            # Interseção da área do foco com a lente de lupa
+            ix1, iy1 = max(x1_lupa, tx1), max(y1_lupa, ty1)
+            ix2, iy2 = min(x1_lupa + lupa_w, tx2), min(y1_lupa + lupa_h, ty2)
             
-            # Verifica interseção com a janela móvel (sweep_x, sweep_y) a (sweep_x+640, sweep_y+640)
-            ix1 = max(sweep_x, tx1)
-            iy1 = max(sweep_y, ty1)
-            ix2 = min(sweep_x + VIEW_W, tx2)
-            iy2 = min(sweep_y + VIEW_H, ty2)
-            
-            # Área de sobreposição
-            inter_w = ix2 - ix1
-            inter_h = iy2 - iy1
-            
-            if inter_w > 40 and inter_h > 40:
-                # Coordenadas relativas à janela móvel de 640x640
-                rx = int(ix1 - sweep_x)
-                ry = int(iy1 - sweep_y)
-                rw = int(inter_w)
-                rh = int(inter_h)
+            if ix2 > ix1 and iy2 > iy1:
+                # Escala proporcionalmente para a janela de Zoom do HUD (360x270)
+                zx1 = int((ix1 - x1_lupa) * (ZOOM_W / lupa_w))
+                zy1 = int((iy1 - y1_lupa) * (ZOOM_H / lupa_h))
+                zx2 = int((ix2 - x1_lupa) * (ZOOM_W / lupa_w))
+                zy2 = int((iy2 - y1_lupa) * (ZOOM_H / lupa_h))
                 
                 detections.append({
                     "class": cls_name,
-                    "bbox": (rx, ry, rw, rh),
-                    "confidence": base_conf + np.random.uniform(-0.02, 0.02),
-                    "center": (rx + rw//2, ry + rh//2)
+                    "bbox_zoom": (zx1, zy1, zx2 - zx1, zy2 - zy1),
+                    "confidence": base_conf
                 })
-                
         return detections
 
 # ==============================================================================
-# DASHBOARD HUD GIS
-# ==============================================================================
-class GISDashboardHUD:
-    def __init__(self):
-        self.alert_history = []
-        self.scan_line_y = 0
-        
-    def add_alert(self, alert):
-        if not self.alert_history or self.alert_history[0]["timestamp"] != alert["timestamp"] or self.alert_history[0]["threat"] != alert["threat"]:
-            self.alert_history.insert(0, alert)
-            if len(self.alert_history) > 5:
-                self.alert_history.pop()
-
-    def draw(self, viewport_frame, detections, active_scenario, sweep_x, sweep_y, img_w, img_h):
-        # 1. Cria a base preta do HUD (1280x720)
-        hud = np.zeros((HUD_H, HUD_W, 3), dtype=np.uint8)
-        
-        # Copia o feed recortado do satélite (640x640) para o centro esquerdo do HUD
-        # Posicionado de y=40 a y=680, e x=40 a x=680
-        hud[40:680, 40:680] = viewport_frame
-        
-        # 2. Desenha o Mini-Mapa de Varredura (Posição orbital no canto direito superior)
-        # Redimensiona a imagem orbital inteira para caber no mini-mapa (240x180)
-        map_w, map_h = 240, 180
-        map_x, map_y = HUD_W - 280, 100
-        
-        # Cria retângulo cinza de fundo para o mini-mapa
-        cv2.rectangle(hud, (map_x - 5, map_y - 5), (map_x + map_w + 5, map_y + map_h + 5), (50, 50, 50), -1)
-        
-        # Carrega e escala a imagem original do cenário
-        sc_name = active_scenario["name"]
-        full_img_path = os.path.join(SATELLITE_DIR, sc_name)
-        if os.path.exists(full_img_path):
-            full_img = cv2.imread(full_img_path)
-            if full_img is not None:
-                mini_map = cv2.resize(full_img, (map_w, map_h))
-                hud[map_y:map_y+map_h, map_x:map_x+map_w] = mini_map
-            
-            # Desenha retângulo verde indicando a janela de varredura ativa
-            rx = int((sweep_x / img_w) * map_w)
-            ry = int((sweep_y / img_h) * map_h)
-            rw = int((VIEW_W / img_w) * map_w)
-            rh = int((VIEW_H / img_h) * map_h)
-            cv2.rectangle(hud, (map_x + rx, map_y + ry), (map_x + rx + rw, map_y + ry + rh), (0, 255, 0), 2)
-            cv2.putText(hud, "TRACKING ORBITAL", (map_x, map_y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 0), 1, cv2.LINE_AA)
-            
-        # 3. Informações Orbitais (Canto Direito)
-        info_x = HUD_W - 280
-        cv2.putText(hud, "TELEMETRIA DE SATELITE", (info_x, 315), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (50, 205, 50), 1, cv2.LINE_AA)
-        cv2.line(hud, (info_x, 323), (HUD_W - 40, 323), (80, 80, 80), 1)
-        
-        cv2.putText(hud, "Satelite: GREENWATCH-1", (info_x, 345), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-        cv2.putText(hud, f"Orbita: Polar Heliossincrona", (info_x, 365), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-        cv2.putText(hud, f"Sensor: Multispectral L1T", (info_x, 385), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-        cv2.putText(hud, f"Regiao: {active_scenario['region']}", (info_x, 405), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 215, 255), 1, cv2.LINE_AA)
-        
-        # Coordenadas geográficas estimadas do centro da câmera
-        center_lat = active_scenario["lat"] - (sweep_y / img_h) * 0.05
-        center_lon = active_scenario["lon"] + (sweep_x / img_w) * 0.05
-        cv2.putText(hud, f"Lat: {center_lat:.5f} S", (info_x, 430), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(hud, f"Lon: {center_lon:.5f} W", (info_x, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-
-        # 4. Histórico de Alertas Orbitais no HUD
-        cv2.putText(hud, "LOG DE RISCOS DETECTADOS", (info_x, 490), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 255), 1, cv2.LINE_AA)
-        cv2.line(hud, (info_x, 498), (HUD_W - 40, 498), (80, 80, 80), 1)
-        
-        if not self.alert_history:
-            cv2.putText(hud, "Nenhuma anomalia ativa.", (info_x, 525), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 120), 1, cv2.LINE_AA)
-        else:
-            for idx, al in enumerate(self.alert_history[:3]):
-                ly = 525 + (idx * 32)
-                color = (0, 0, 255) if al["threat"] == "FOGO" else (0, 200, 255)
-                # Sinalizador colorido
-                cv2.rectangle(hud, (info_x, ly - 9), (info_x + 5, ly), color, -1)
-                
-                # Texto georreferenciado
-                txt = f"[{al['time_only']}] {al['threat']} ({al['area_hectares']} ha)"
-                cv2.putText(hud, txt, (info_x + 15, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
-                cv2.putText(hud, f"Coord: {al['coordinates']['latitude']:.4f}S / {al['coordinates']['longitude']:.4f}W", (info_x + 15, ly + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1, cv2.LINE_AA)
-
-        # 5. Barra Superior de Status do Sistema
-        cv2.rectangle(hud, (0, 0), (HUD_W, 40), (25, 25, 25), -1)
-        cv2.line(hud, (0, 40), (HUD_W, 40), (50, 205, 50), 2)
-        cv2.putText(hud, "GREENWATCH-1 GIS ORBITAL TERMINAL", (25, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(hud, f"CENARIO: {active_scenario['title'].upper()}", (460, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (50, 205, 50), 1, cv2.LINE_AA)
-
-        # 6. Painel de Comandos (Rodapé)
-        cv2.rectangle(hud, (0, HUD_H - 40), (HUD_W, HUD_H), (20, 20, 20), -1)
-        cv2.line(hud, (0, HUD_H - 40), (HUD_W, HUD_H - 40), (50, 50, 50), 1)
-        cv2.putText(hud, "Teclas: [1, 2, 3] Chavear Satelite | [S] Salvar Visada | [Q] Sair", (25, HUD_H - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
-        
-        # Indicador de IA ativa ou simulada no rodapé
-        detector_status = "YOLOv8 ATIVO (Modelo Real)" if YOLO_AVAILABLE else "YOLOv8 SIMULADO (Aguardando pesos)"
-        det_color = (0, 255, 0) if YOLO_AVAILABLE else (0, 190, 255)
-        cv2.putText(hud, detector_status, (HUD_W - 350, HUD_H - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, det_color, 1, cv2.LINE_AA)
-
-        # 7. Desenha Linhas de Varredura Estilo Radar/Satélite sobre o feed
-        # Adiciona uma grade orbital fina de satélite (cruzamento de coordenadas)
-        for i in range(1, 4):
-            # Linha vertical
-            cv2.line(hud, (40 + i*160, 40), (40 + i*160, 680), (120, 255, 120), 1)
-            # Linha horizontal
-            cv2.line(hud, (40, 40 + i*160), (680, 40 + i*160), (120, 255, 120), 1)
-            
-        # Linha laser de scanner em movimento
-        self.scan_line_y = (self.scan_line_y + 8) % VIEW_H
-        cv2.line(hud, (40, 40 + self.scan_line_y), (680, 40 + self.scan_line_y), (0, 255, 0), 1)
-
-        # 8. Desenha as caixas do YOLO no Feed do HUD
-        for det in detections:
-            rx, ry, rw, rh = det["bbox"]
-            label = det["class"].upper()
-            conf = det["confidence"]
-            
-            # Ajusta para a coordenada local do HUD (deslocamento x=40, y=40)
-            hx = rx + 40
-            hy = ry + 40
-            
-            color = (0, 0, 255) if "fogo" in det["class"] else (0, 200, 255)
-            
-            # Desenha bounding box
-            cv2.rectangle(hud, (hx, hy), (hx + rw, hy + rh), color, 2)
-            
-            # Rótulo
-            lbl = f"{label} {conf*100:.0f}%"
-            (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
-            cv2.rectangle(hud, (hx, hy - 18), (hx + tw + 6, hy), color, -1)
-            cv2.putText(hud, lbl, (hx + 3, hy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
-            
-            # Desenha retículo central
-            cx = hx + rw // 2
-            cy = hy + rh // 2
-            cv2.drawMarker(hud, (cx, cy), color, cv2.MARKER_TILTED_CROSS, 10, 1)
-
-        # 9. Flashing red border on emergency
-        has_fire = any("fogo" in d["class"] for d in detections)
-        if has_fire and int(time.time() * 2.5) % 2 == 0:
-            cv2.rectangle(hud, (40, 40), (680, 680), (0, 0, 255), 4)
-            cv2.rectangle(hud, (info_x - 10, 480), (HUD_W - 30, 680), (0, 0, 255), 2)
-            cv2.putText(hud, "EMERGENCIA AMBIENTAL", (info_x, 478), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 0, 255), 1, cv2.LINE_AA)
-
-        return hud
-
-# ==============================================================================
-# LOOP ORBITAL PRINCIPAL
+# 4. PIPELINE PRINCIPAL DO SISTEMA
 # ==============================================================================
 def main():
-    print("=" * 70)
-    print("      GREENWATCH CV - RASTREAMENTO ORBITAL DE INCENDIOS COM YOLOv8")
-    print("=" * 70)
-    
-    # Inicializa componentes
-    detector = SatelliteYoloDetector()
-    hud_drawer = GISDashboardHUD()
-    
-    current_key = "1"
-    active_scenario = SCENARIOS[current_key]
-    
-    # Carrega imagem de satélite inicial
-    def load_satellite_image(sc_cfg):
-        path = os.path.join(SATELLITE_DIR, sc_cfg["name"])
-        if not os.path.exists(path):
-            print(f"[ERROR] Imagem {path} nao encontrada. Criando fundo cinza de backup.")
-            backup = np.ones((1200, 1600, 3), dtype=np.uint8) * 60
-            cv2.putText(backup, "IMAGEM INDISPONIVEL", (300, 600), cv2.FONT_HERSHEY_SIMPLEX, 2, (180, 180, 180), 3)
-            return backup
-        
-        img = cv2.imread(path)
-        if img is None:
-            print(f"[ERROR] Nao foi possivel ler/decodificar a imagem {path}. Criando fundo de backup.")
-            backup = np.ones((1200, 1600, 3), dtype=np.uint8) * 60
-            cv2.putText(backup, "ERRO DE LEITURA", (300, 600), cv2.FONT_HERSHEY_SIMPLEX, 2, (180, 180, 180), 3)
-            return backup
-            
-        # Garante alta resolução 1600x1200 para varredura suave
-        return cv2.resize(img, (1600, 1200))
 
-    sat_image = load_satellite_image(active_scenario)
-    img_h, img_w = sat_image.shape[:2]
 
-    # Coordenadas iniciais do Varredor Orbital (Sweep)
-    sweep_x = 0
-    sweep_y = 0
-    dir_x = 1  # 1 = Direita, -1 = Esquerda
-    dir_y = 1  # 1 = Baixo, -1 = Cima
+    if not os.path.exists(MODEL_PATH):
+        print("[MEDIAPIPE] Baixando automaticamente 'hand_landmarker.task'...")
+        import urllib.request
+        urllib.request.urlretrieve("https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", MODEL_PATH)
+
+    # Inicialização da Webcam
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[ERROR] Webcam fisica indisponivel.")
+        return
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    # Configuração do rastreador gestual do MediaPipe Tasks
+    base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = vision.HandLandmarkerOptions(base_options=base_options, running_mode=vision.RunningMode.VIDEO, num_hands=1)
+    detector = vision.HandLandmarker.create_from_options(options)
+
+    # Inicialização do detector YOLOv8
+    yolo_detector = ZoomYoloDetector()
+
+    # Estado Inicial
+    cenario_atual = "1"
+    cfg = SCENARIOS[cenario_atual]
+    sat_img = carregar_satelite(cenario_atual)
+
+    # Coordenadas e dinâmica de Zoom da Lente Móvel
+    laser_x, laser_y = MAP_W // 2, MAP_H // 2
+    current_lupa_w, current_lupa_h = 160, 120
     
-    # Histerese de alerta
-    fire_frames = 0
-    smoke_frames = 0
-    
-    print("[SISTEMA] Varredura Orbital iniciada com sucesso. Janela OpenCV aberta.")
+    gesture_hold_frames = 0
+    active_gesture = "Nenhum"
+    last_timestamp = 0
+    fire_first_seen_time = None
 
     while True:
-        # 1. Movimentação sistemática da varredura orbital (zigzag suave)
-        step_x = 4 # Velocidade orbital no eixo X (pixels por frame)
-        sweep_x += dir_x * step_x
-        
-        # Limites no eixo X (Viewport 640x640 na imagem 1600x1200)
-        max_x = img_w - VIEW_W
-        max_y = img_h - VIEW_H
-        
-        if sweep_x >= max_x:
-            sweep_x = max_x
-            dir_x = -1
-            # Incrementa o eixo Y ao atingir a borda lateral
-            sweep_y += 70 * dir_y
-        elif sweep_x <= 0:
-            sweep_x = 0
-            dir_x = 1
-            sweep_y += 70 * dir_y
+        ret, web_frame = cap.read()
+        if not ret:
+            break
             
-        # Limites no eixo Y
-        if sweep_y >= max_y:
-            sweep_y = max_y
-            dir_y = -1
-        elif sweep_y <= 0:
-            sweep_y = 0
-            dir_y = 1
+        web_frame = cv2.flip(web_frame, 1)
+        h_web, w_web = web_frame.shape[:2]
+        
+        # Converte para mp.Image e envia para processamento
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(web_frame, cv2.COLOR_BGR2RGB))
+        
+        # Cooldown para garantir timestamp estritamente crescente
+        timestamp_ms = int(time.time() * 1000)
+        if timestamp_ms <= last_timestamp:
+            timestamp_ms = last_timestamp + 1
+        last_timestamp = timestamp_ms
+        
+        results = detector.detect_for_video(mp_image, timestamp_ms)
+        has_hand = bool(results.hand_landmarks)
 
-        # 2. Recorta o frame de visualização ativo (640x640)
-        viewport_frame = sat_image[sweep_y:sweep_y+VIEW_H, sweep_x:sweep_x+VIEW_W].copy()
+        fingers_count = 5
+        detected_landmarks = []
         
-        # 3. Executa inferência do YOLOv8 (Real ou Simulada)
-        detections = detector.detect(viewport_frame, current_key, sweep_x, sweep_y)
-        
-        # 4. Histerese e Processamento de Alertas GIS
-        has_fire = any("fogo" in d["class"] for d in detections)
-        has_smoke = any("fumaca" in d["class"] for d in detections)
-        
-        # Mapeamento dinâmico de coordenadas GPS do foco detectado
-        # Cada pixel representa aproximadamente 10 metros no solo
-        if has_fire:
-            fire_frames += 1
-            if fire_frames >= 4: # Confirmado por 4 frames consecutivos
-                fire_det = next(d for d in detections if "fogo" in d["class"])
-                rx, ry, rw, rh = fire_det["bbox"]
-                
-                # Conversão para escala global e latitude/longitude
-                abs_x = sweep_x + rx + rw // 2
-                abs_y = sweep_y + ry + rh // 2
-                
-                target_lat = active_scenario["lat"] - (abs_y / img_h) * 0.05
-                target_lon = active_scenario["lon"] + (abs_x / img_w) * 0.05
-                
-                # Cálculo da área baseado no tamanho do bounding box (1 pixel = 100 m² = 0.01 hectares)
-                area_ha = (rw * rh * 100) / 10000.0
-                
-                # Grava alerta estruturado
-                alert = GISAlertLogger.log_alert("FOGO", fire_det["confidence"], target_lat, target_lon, area_ha, active_scenario["region"])
-                hud_drawer.add_alert(alert)
-        else:
-            fire_frames = 0
-            
-        if has_smoke:
-            smoke_frames += 1
-            if smoke_frames >= 6: # Confirmado por 6 frames
-                smoke_det = next(d for d in detections if "fumaca" in d["class"])
-                rx, ry, rw, rh = smoke_det["bbox"]
-                
-                abs_x = sweep_x + rx + rw // 2
-                abs_y = sweep_y + ry + rh // 2
-                
-                target_lat = active_scenario["lat"] - (abs_y / img_h) * 0.05
-                target_lon = active_scenario["lon"] + (abs_x / img_w) * 0.05
-                area_ha = (rw * rh * 100) / 10000.0
-                
-                alert = GISAlertLogger.log_alert("FUMACA", smoke_det["confidence"], target_lat, target_lon, area_ha, active_scenario["region"])
-                hud_drawer.add_alert(alert)
-        else:
-            smoke_frames = 0
+        # Processa e desenha a mão se detectada
+        if has_hand:
+            hand_landmarks = results.hand_landmarks[0]
+            detected_landmarks = hand_landmarks
+            desenhar_esqueleto_mao(web_frame, hand_landmarks, w_web, h_web)
+            fingers_count = contar_dedos_abertos(hand_landmarks)
 
-        # 5. Renderiza a tela do Dashboard HUD
-        hud_frame = hud_drawer.draw(viewport_frame, detections, active_scenario, sweep_x, sweep_y, img_w, img_h)
+        # Prepara a tela final do HUD e o painel de Zoom
+        sat_display = sat_img.copy()
+        zoom_display = np.ones((ZOOM_H, ZOOM_W, 3), dtype=np.uint8) * 20
+        cv2.putText(zoom_display, "AGUARDANDO SINAL DE LENTE", (40, ZOOM_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (120, 120, 120), 1, cv2.LINE_AA)
         
-        # 6. Exibe na tela
-        cv2.imshow(WINDOW_NAME, hud_frame)
+        lupa_ativa = False
+        tem_fogo = False
         
-        # 7. Entrada de teclado
-        key = cv2.waitKey(15) & 0xFF  # Cerca de 60 FPS suavizado
-        
-        # Alternância de Cenários de Satélite
-        if key in [ord('1'), ord('2'), ord('3')]:
-            current_key = chr(key)
-            active_scenario = SCENARIOS[current_key]
-            sat_image = load_satellite_image(active_scenario)
-            # Reseta coordenadas de varredura
-            sweep_x, sweep_y = 0, 0
-            dir_x, dir_y = 1, 1
-            print(f"[SATELITE] Chaveando para o cenario: {active_scenario['title']}")
+        # Executa as lógicas de gestos e Lupa Inteligente
+        if detected_landmarks:
+            lupa_ativa = True
             
-        # Tecla S: Salva Snapshot manual do frame e HUD
-        elif key == ord('s') or key == ord('S'):
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{SNAPSHOTS_DIR}/orbital_scan_{timestamp}.jpg"
-            cv2.imwrite(filename, hud_frame)
-            print(f"[SNAPSHOT] Captura orbital salva em: {filename}")
+            # Rastreamento tático baseado no centro da palma (Landmark 9)
+            laser_x = int(laser_x * 0.70 + (detected_landmarks[9].x * MAP_W) * 0.30)
+            laser_y = int(laser_y * 0.70 + (detected_landmarks[9].y * MAP_H) * 0.30)
             
-        # Tecla Q ou Esc: Sai da aplicação
-        elif key == ord('q') or key == ord('Q') or key == 27:
-            print("[SISTEMA] Desconectando do terminal orbital...")
+            # Escolhe o nível de zoom dinâmico com base nos gestos
+            if fingers_count == 5:
+                target_w, target_h = 96, 72  # Zoom In Máximo (3.75x)
+                active_gesture = "ZOOM IN MÁXIMO (Mao Aberta)"
+                gesture_hold_frames = 0
+            elif fingers_count == 0:
+                target_w, target_h = 240, 180  # Zoom Out (1.5x)
+                active_gesture = "ZOOM OUT (Mao Fechada)"
+                gesture_hold_frames = 0
+            elif fingers_count == 2:
+                target_w, target_h = 160, 120  # Zoom Médio Padrão
+                active_gesture = "PROXIMO CENARIO (victory)"
+                gesture_hold_frames += 1
+                
+                # Barra compacta de progresso para trocar de cenário gestualmente
+                cv2.rectangle(sat_display, (40, MAP_H - 120), (340, MAP_H - 75), (30, 30, 30), -1)
+                cv2.rectangle(sat_display, (40, MAP_H - 120), (340, MAP_H - 75), (80, 80, 80), 1)
+                progress = min(gesture_hold_frames / 40.0, 1.0)
+                cv2.rectangle(sat_display, (45, MAP_H - 115), (45 + int(290 * progress), MAP_H - 105), (255, 100, 0), -1)
+                cv2.putText(sat_display, "TRANSMITINDO TROCA DE CANAL...", (45, MAP_H - 85), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1, cv2.LINE_AA)
+                
+                if gesture_hold_frames >= 40:
+                    cenario_atual = str(int(cenario_atual) % 3 + 1)
+                    cfg = SCENARIOS[cenario_atual]
+                    sat_img = carregar_satelite(cenario_atual)
+                    gesture_hold_frames = 0
+            else:
+                target_w, target_h = 160, 120  # Zoom Médio padrão
+                active_gesture = "TRACKING ORBITAL (Zoom Medio)"
+                gesture_hold_frames = 0
+                
+            # Interpolação suave para simular o comportamento de lente física mecânica
+            current_lupa_w = int(current_lupa_w * 0.82 + target_w * 0.18)
+            current_lupa_h = int(current_lupa_h * 0.82 + target_h * 0.18)
+        else:
+            active_gesture = "NENHUMA MAO DETECTADA"
+            gesture_hold_frames = 0
+            # Retorna de forma fluida para as dimensões padrão
+            current_lupa_w = int(current_lupa_w * 0.85 + 160 * 0.15)
+            current_lupa_h = int(current_lupa_h * 0.85 + 120 * 0.15)
+
+        # Limita e calcula a caixa da lupa no mapa
+        x1_lupa = max(0, min(laser_x - current_lupa_w // 2, MAP_W - current_lupa_w))
+        y1_lupa = max(0, min(laser_y - current_lupa_h // 2, MAP_H - current_lupa_h))
+        x2_lupa, y2_lupa = x1_lupa + current_lupa_w, y1_lupa + current_lupa_h
+        
+        # Realiza o Crop e Zoom do frame selecionado
+        if lupa_ativa or (current_lupa_w != 160 or current_lupa_h != 120):
+            cv2.rectangle(sat_display, (x1_lupa, y1_lupa), (x2_lupa, y2_lupa), (0, 255, 0), 2)
+            cv2.drawMarker(sat_display, (laser_x, laser_y), (0, 255, 0), cv2.MARKER_CROSS, 16, 1)
+            
+            crop = sat_img[y1_lupa:y2_lupa, x1_lupa:x2_lupa]
+            if crop.size > 0:
+                zoom_display = cv2.resize(crop, (ZOOM_W, ZOOM_H))
+                zoom_detections = yolo_detector.detect(zoom_display, cenario_atual, x1_lupa, y1_lupa, current_lupa_w, current_lupa_h)
+                
+                tem_fogo = any(d["class"] == "fogo" for d in zoom_detections)
+                
+                # Desenha marcações de incêndios na janela de Zoom
+                for det in zoom_detections:
+                    zx, zy, zw, zh = det["bbox_zoom"]
+                    color = (0, 0, 255) if det["class"] == "fogo" else (0, 200, 255)
+                    cv2.rectangle(zoom_display, (zx, zy), (zx + zw, zy + zh), color, 2)
+                    cv2.putText(zoom_display, f"IA: {det['class'].upper()} {det['confidence']*100:.0f}%", 
+                                (zx, zy - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
+
+        # Lógica de cálculo de tempo contínuo de fogo
+        if tem_fogo:
+            if fire_first_seen_time is None:
+                fire_first_seen_time = time.time()
+            fire_duration = time.time() - fire_first_seen_time
+        else:
+            fire_first_seen_time = None
+            fire_duration = 0.0
+
+        # RENDERIZAÇÃO DA INTERFACE HUD GIS
+        # Barra de Status Superior
+        cv2.rectangle(sat_display, (0, 0), (MAP_W, 55), (15, 15, 15), -1)
+        cv2.line(sat_display, (0, 55), (MAP_W, 55), (255, 100, 0), 2)
+        cv2.putText(sat_display, "GREENWATCH GIS - CENTRAL GESTUAL (MEDIAPIPE)", (25, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(sat_display, f"CENARIO: {cfg['title'].upper()}", (MAP_W - 450, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 100, 0), 1, cv2.LINE_AA)
+        
+        # Painel Lateral de Telemetria
+        cv2.rectangle(sat_display, (20, 80), (380, 210), (15, 15, 15), -1)
+        cv2.rectangle(sat_display, (20, 80), (380, 210), (80, 80, 80), 1)
+        cv2.putText(sat_display, "DADOS DE RASTREAMENTO GESTUAL", (35, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 100, 0), 1, cv2.LINE_AA)
+        cv2.line(sat_display, (35, 112), (365, 112), (60, 60, 60), 1)
+        cv2.putText(sat_display, f"Gesto: {active_gesture}", (35, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
+        cv2.putText(sat_display, f"Dedos: {fingers_count}", (35, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
+        
+        zoom_nivel = ZOOM_W / current_lupa_w
+        cv2.putText(sat_display, f"ZOOM ATIVO: {zoom_nivel:.2f}x", (35, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1, cv2.LINE_AA)
+        
+        lat_laser = cfg["lat"] - (laser_y / MAP_H) * 0.05
+        lon_laser = cfg["lon"] + (laser_x / MAP_W) * 0.05
+        cv2.putText(sat_display, f"LENTE GPS: {lat_laser:.5f} S, {lon_laser:.5f} W", (35, 198), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+
+        # Painel de Análise de Zoom de IA
+        px_zoom, py_zoom = 20, 230
+        cv2.rectangle(sat_display, (px_zoom, py_zoom), (px_zoom + ZOOM_W, py_zoom + ZOOM_H), (15, 15, 15), -1)
+        cv2.rectangle(sat_display, (px_zoom - 3, py_zoom - 3), (px_zoom + ZOOM_W + 3, py_zoom + ZOOM_H + 3), (255, 100, 0), 2)
+        sat_display[py_zoom:py_zoom+ZOOM_H, px_zoom:px_zoom+ZOOM_W] = zoom_display
+        
+        cv2.rectangle(sat_display, (px_zoom, py_zoom), (px_zoom + 180, py_zoom + 22), (15, 15, 15), -1)
+        cv2.putText(sat_display, f"ZOOM IA ({yolo_detector.weight_name})", (px_zoom + 6, py_zoom + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1, cv2.LINE_AA)
+
+        # Efeito de Alerta Vermelho Piscante (Fogo Confirmado por 5s)
+        if fire_first_seen_time is not None and fire_duration >= 5.0:
+            if int(time.time() * 3.3) % 2 == 0:
+                cv2.rectangle(sat_display, (0, 0), (MAP_W, MAP_H), (0, 0, 255), 6)
+                bx, by, bw, bh = MAP_W // 2 - 280, 80, 560, 50
+                cv2.rectangle(sat_display, (bx, by), (bx + bw, by + bh), (0, 0, 255), -1)
+                cv2.rectangle(sat_display, (bx, by), (bx + bw, by + bh), (255, 255, 255), 2)
+                cv2.putText(sat_display, "!!! INCENDIO CONFIRMADO - ALERTA VERMELHO !!!", (bx + 25, by + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # Câmera do Operador PIP (Webcam) no canto inferior direito
+        pip_w, pip_h = 240, 180
+        px_start, py_start = MAP_W - pip_w - 20, MAP_H - pip_h - 20
+        cv2.rectangle(sat_display, (px_start - 3, py_start - 3), (px_start + pip_w + 3, py_start + pip_h + 3), (255, 100, 0), 2)
+        sat_display[py_start:py_start+pip_h, px_start:px_start+pip_w] = cv2.resize(web_frame, (pip_w, pip_h))
+        cv2.putText(sat_display, "OPERADOR WEBCAM", (px_start, py_start - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 100, 0), 1, cv2.LINE_AA)
+
+        cv2.imshow(WINDOW_NAME, sat_display)
+        
+        key = cv2.waitKey(10) & 0xFF
+        if key in [ord('q'), ord('Q'), 27]:
             break
 
+    cap.release()
+    try:
+        detector.close()
+    except Exception:
+        pass
     cv2.destroyAllWindows()
-    print("=" * 70)
-    print("       GREENWATCH CV - CONEXÃO ORBITAL ENCERRADA COM SUCESSO!")
-    print("=" * 70)
 
 if __name__ == "__main__":
     main()

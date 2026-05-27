@@ -26,3 +26,4 @@ snapshots/
 *.njsproj
 *.sln
 *.swp
+.antigravitycli/
